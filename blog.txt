@@ -1,0 +1,151 @@
+I am using one parameter in the project configuration file “depends_on_past = True”.
+But I need a capability to run the task not only when previous task is succeeded but also failed. Could you please help me achieve this?
+Note: I need dependency on previous task, wanted to start current task only when succeeded or failed. But now depends_on_past = True helps me depend only on previous task's success state.
+I appreciate any help here.
+Even I am looking for the same kind of parameter.
+/n
+Couple of things are left over in order to fully support UTC
+1.	End_dates within directed acyclic graph (DAG) should be converted to UTC (coordinated universal time);
+2.	Task instances that are instantiated without time zone information for their execution_date should convert thosed to UTC by using the DAG’s timezone or configured;
+3.	Updates documentation;
+4.	Tests should be added that cover more of the edge cases.
+/n
+The need to align the start_date in directed acyclic graph (DAG) with the interval is counter intuitive and leads to a lot of questions and issue creation, although it is in the documentation. If we are able to fix this with none or little consequences for current setups that should be preferred, I think. The dependency explainer is really great work, but it doesn’t address the core issue.
+Following are some use cases can better explain this issue.
+Imagine the following
+Use Case 1
+Dag1 has an assigned start_date "2016-04-24 00:00:00" with a cron schedule of “10 1 * * *”, ie run every day at 1.10am. Depends_on_past is true.
+The current scheduler kicks off a run “2016-04-24 00:00:00” and then stops as the previous interval of “2016-04-24 01:10:00” is “2016-04-23 01:10:00”. This cannot be found as it has not taken place and thus the whole thing grinds to a halt and the TaskInstances refuse to run.
+What the user expects here is that the first run is “2016-04-24 01:10:00”, ie start_date + interval, unless the start_date is on the interval, ie. start_date is first interval. This is what I address by start_date normalization in the PR. However, the second issue then kicks in as the “previous” run can still not be found.
+Use Case 2
+Dag2 has an assigned start_date "2016-04-24 01:10:00" with a cron schedule of “10 1 * * *”. Depends_on_past is true.
+The scheduler happily goes through a few runs, but then the dag is updated and the schedule adjusted. Because the previous interval cannot be found by the TaskInstance (emphasis), tasks get stuck again requiring an manual override.
+What the user expects here is that the scheduler is smart enough to figure out that we are still running the same dag and that it needs to look up the previous run for that dag and make sure dependencies are met with that previous dagrun in mind.
+I don’t think those two use cases are edge cases, considering the amount of questions we get on these subjects.
+To resolve the remaining issues (aside from start_date normalization) I first made DagRun aware of its predecessors. Then I strengthened the relationship between TaskInstances and DagRuns slightly, by optionally including a dagrun_id in the TaskInstance. Now a TaskInstance can lookup its predecessors in the previous DagRun and know for sure that it is either the first run or it has a predecessor somewhere in time instead of guessing.
+What I am unsure of is what to consider is the unit of work: 1) is a TaskInstance dependent on its past predecessor ignoring the outcome of the DagRun? (previous TaskInstance can be successful, but previous DagRun as a whole can fail) or 2) is it dependent on the outcome of the DagRun? 3) Can it be both? In case of 1 and 3 my logic needs to be updated slightly, but that should not be too much of a big deal. However I have difficulty imagining why you want to do that.
+Jeremiah made some comments about why an ID is used for connecting the TaskInstances to DagRuns instead of dag_id + execution_date.
+The first reason is that backfills can have arbitrary execution_dates and as such conflict with the assumption that dag_id+execution_date is unique. If we treat backfills differently we might be able to workaround this.
+Secondly, relying on dates as part of a primary key doesn't feel right. If running multiple schedulers you might have a small chance to a race condition as two equal dates might be inserted. In addition a combined key would also require that key to be present in TaskInstances. These keys are present but they are guestimated by a calculation and do not seem atomic.
+w.r.t. the DagRun.previous, will there be any problems if a the pervious DagRun changes while a DagRun is instantiated (e.g. a backfill is run, or a DagRun is cleared via the UI)?
+No it shouldn't - although my code needs a bit of an update for it. What I discussed with Jeremiah just a minute ago is that I do need to "insert" backfill into the linked list. i.e. if a backfill starts before the latest dag run (ie. its execution_date is smaller) I need to update the previous id in order to maintain the timeline. And I do need to make the scheduler aware of backfill jobs, so it won't start a DagRun at the same execution date.
+/n
+I'm triggering a lot of DAGs manually using "airflow trigger_dag my_dag --run_id=some_unique_id". I would like to be able in the UI to browse easily to this specific DAG run using the "some_unique_id" label. In the graph page of the DAG, I need to know the exact execution date, which is inconvenient, and in the Browse -> DAG Runs page I can search by "some_unique_id", but the "Run Ids" column is not clickable.
+The attached patch makes the aforementioned column clickable, so I'm sent directly to the graph view for that specific DAG run, not the DAG in general.
+Updated patch to contain execution_date in the generated link. This lets the graph show the correct DAG run instead of the latest, if there are multiple DAG runs with the same run_id. 
+I was working on the same issue and created a pull-request on Airflow.
+And i've added link to a the run-id which I found in your patch attachment.
+/n
+From the given example set, when I am using qbol operator for a hive workload, whose script resides in s3 and ends with ".qbl", I am getting "Template Not Found" error. 
+Also it would be nice, if airflow always tags commands going from airflow to qds.
+Could you please provide a stack trace and example DAG? 
+/n
+Add Elasticsearch log handler and reader for querying logs in ES.
+To be clear, are you planning to REMOVE support for S3/GCS? We are heavy users of GCS for logging, and this would be a show stopper for us. 
+Yes airflow will only use ES if the user configures the logging_backend_url and S3/GCS won't be removed 
+/n
+Currently using the execution_date_fn parameter of the ExternalTaskSensor sensors only allows to wait for the completion of one given run of the task the ExternalTaskSensor is sensing. However, this prevents users to have setups where dags don't have the same schedule frequency but still depend on one another. For example, let's say you have a dag scheduled hourly that transforms log data and is owned by the team in charge of logging. In the current setup you cannot have other higher level teams, that want to use this transformed data, create dags processing transformed log data in daily batches, while making sure the logged transformed data was properly created. Note that simply waiting for the data to be present (using e.g. the HivePartitionSensor if the data is in hive) might not be satisfactory because the data being present doesn't mean it is ready to be used. Adding the ability for an ExternalTaskSensor to wait for multiple runs of the task it is sensing to have finished would allow higher level teams to setup dags with an ExternalTaskSensor sensing the end task of the dag that transforms the log data and to wait for the successful completion of 24 of its hourly runs.
+We are trying to switch from Oozie to Airflow at Booking.com and would really need this feature (or maybe there's already a way to achieve this) for us to go forward with the migration. 
+I implemented your suggestion, would you mind reviewing? 
+/n
+Currently using the execution_date_fn parameter of the ExternalTaskSensor sensors only allows to wait for the completion of one given run of the task the ExternalTaskSensor is sensing. However, this prevents users to have setups where dags don't have the same schedule frequency but still depend on one another. For example, let's say you have a dag scheduled hourly that transforms log data and is owned by the team in charge of logging. In the current setup you cannot have other higher level teams, that want to use this transformed data, create dags processing transformed log data in daily batches, while making sure the logged transformed data was properly created. Note that simply waiting for the data to be present (using e.g. the HivePartitionSensor if the data is in hive) might not be satisfactory because the data being present doesn't mean it is ready to be used. Adding the ability for an ExternalTaskSensor to wait for multiple runs of the task it is sensing to have finished would allow higher level teams to setup dags with an ExternalTaskSensor sensing the end task of the dag that transforms the log data and to wait for the successful completion of 24 of its hourly runs.
+Thanks for taking this on. This is an important and much requested roadmap feature. I'll pull your code and help test it.
+Sounds like we still need "Avoid scheduling multiple instances of a task that has been marked as only_run_latest and prioritize the most recent execution date" 
+/n
+It will be nice to be able to specify cc, bcc recipients for the EmailOperator.
+Since the pull request is merged, I am resolving this issue. I hope it is in sync with the jira workflow being followed in the project.
+NOTE Fix version is not set yet as I am not sure what is the correct Fix Version (1.8 / 2.0)
+/n
+I installed latest version of Airflow via pip and I noticed that it is now unable to use any hook. Installing boto solves the issue.
+Not sure if there isn't a configuration issue on my system, however maybe boto should be added as a dependency?
+Can you try running off of master? I'm wondering if my PR fixes this. Also, this is expected behavior. You need to pip install airflow[s3]. My PR will at least tell you that the boto package is missing, rather than just say the hook doesn't exist. 
+OK, my bad. Thanks for your explanation. 
+/n
+Projects that have errai-validation and dashbuilder-validations fail at runtime because both of these modules have rebind rules for ValidatorFactory. The best solution would be for Dashbuilder to use Errai Validation. This would remove some of the boilerplate validation code in the dashbuilder-validations module. For instance Dashbuilder's custom ValidatorFactory is not necessary when using Errai Validation; Errai automatically generates it.
+Sent PR's that move validations to errai-validation. 
+Fixed validations
+/n
+Displayer editor used to have bunch of controls for controlling appearance of chart (width, title, labels display etc.). Now the tab only contains one input field with "filter properties..." placeholder.
+This issue can no longer be reproduced in kie-wb 7.0 
+This issue appeared again on master. And this time it appears quite consistently (almost 100%) - when testing kie-wb distro for EAP7 on EAP7 - the problem seems like in the original screenshot.
+The problem also appears in similar form when editting metric displayer HTML/CSS/Javascript - very often the three tabs are missing (added screenshot). David Gutierrez could you please try to reproduce these with kie-wb on eap7? To reproduce this you just need to go to plugin management perspective and create new perspective layout & add displayer.
+/n
+Static dataset definitions deployed to business-central.war/WEB-INF/datasets/ of type SQL are no longer being imported after these changes. I'm pretty sure this is a recent problem, because I also tried with 14days old snapshot and all datasets were imported correctly. I debugged this problem and it seems that DataSetProviderRegistryImpl only contains entries for STATIC and BEAN providers, but not for any other provider type. This is consistent with what I see in UI - only my Bean provider is imported, but none of the SQL ones.
+This seems to be some order-of-initialization issue. Across multiple test runs I see that SQL dataset definitions are imported in some tests but not in others. 
+/n
+After creation of a new task in the Tasks perspective, the CreatedOn column shows incorrect time (e.g. task created on 14:16 shows time 14:32 and another task created at the same time shows time 14:29). Moreover, after sorting in the CreatedOn column the tasks are not sorted correctly. More in the attachment (note that all tasks were created within several seconds). This is problem specific for Oracle database. Sorting on CreatedOn date on all other databases works correctly.
+I have tested it on oracle12c and I couldn't reproduce the issue. Maybe is related with the oracle version.
+Can you give us more information related with the environment that generates this issue?
+Thanks! 
+I couldn't reproduce the issue. Feel free to reopen with more information. 
+Ok, no success on my side either. 
+I finally investigated this issue more deeply and the problem seems to be coming from the processing of Dashbuilder Datasets. The date/time displayed in Task Details logs section corresponds to what is in the database. The date/time displayed in Tasklist grid is coming from dashbuilder datasets which is calling OracleDialect #convertToDate for conversion from oracle.sql.TIMESTAMP to java.util.Date. I debugged this thorougly and observed that minutes/seconds in the input (oracle.sql.TIMESTAMP) do not correspond to minutes seconds in the output (java.util.Date). 
+/n
+Add the ability to create & persist brand new dashboards. This feature is key if we want user to be able to create dashboards from scratch and have those dashboards survive to server restarts. Currently, we can use the Uberfire's perspective editor to create dashboards. However, at the time of writing, this is in a very early stage, kinda prototype. On the other hand, Uberfire also provides a default NSWE (Norh South West East) layout manager. NSWE layouts are simpler to use and they allow build a dashboard quickly. This new feature consists of allowing users to manage (create/save/delete) NSWE based dashboards. The dashboards created will be accessible from a top level menu. The persistent storage is provided by the Uberfire's VFS subsystem which is configured to run under GIT by default.
+Initial implementation which lets the user to drag&drop only displayers to a brand new perspective. Created perspectives are listed on a specific entry in the top menu bar. No support for HTML, dynamic menus yet. 
+The main goal is to provide a complete dashboard editor tooling at a similar level of what the former dashbuilder technology provides. 
+/n
+Currently, metric displayers allow for adding single value metrics to a dashboard. The metric is displayed using a BS3 jumbotron (a coloured box with the metric value inside). It is required to extend the current functionality of metric displayers in order to support different visualization scenarios. For example, imagine a plain text metric: "Total amount of expenses: $5000"... which is basically a string containing the metric value. Users might also want to provide more complex HTML templates in order to customize how the metric is displayed. An HTML template is the more flexible approach as it allows users to mix metric values with HTML content.
+The development is done and ready for review 
+/n
+Provide a way to list the datasources available in the underlying container so that end users can select them from the SQL provider configuration screen. Right now, a JNDI name is required which is a bit annoying and low level. We aim for a better and user friendly mechanism.
+Development done. PR submitted. The default implementation reads the available datasources from continer's JNDI tree. It is possible to overwrite the default impl by extending the SQLDataSourceLocatorCDI impl, and make such impl available on classpath. For instance. Notice the usage of the @Specializes annotation, which forces the CDI subsystem to lookup the extended class. 
+/n
+Provide a new perspective for authoring dashboards as a simplified version of the Plugins perspective, with the following goals in mind:
+1.- Hide the technical details associated with the plugin concept
+2.- Ability to define an maintain a tree of navigation items
+3.- Make the top menu bar 100% dynamic according to the navigation tree defined
+4.- Provide several navigation widgets to allow for the configuration of the navigation within a runtime perspective: menu bar, tile nav, tab list, carousel
+First iteration pushed to master. 
+/n
+I have several issues when changing column types using a widget in UI. See video showing some issues. 
+1) When column is recognized to have type DATE I can change it to some other type, but then I can never make it to have type DATE again (only by deleting DS Def and creating it again)
+2) When column has type number, it is impossible to change it to other types. It should be possible to change it to Text / Label, shouldn't it?
+It only seems to be working for SQL types, not for CSV neither BEAN. Trying to check if it's a data provider backend issue or a widget one. 
+Fixed and veritfied.
+All data provider types support changing column types and change back to original types, except BEAN type, which does not allow modifying column types (no dropdown caret trigger visible).
+/n
+The radio buttons for choosing SQL Datasource's Source parameter are setup incorrectly:
+1) It is possible by clicking multiple times on Query / Table radio button labels, to make both radios enabled (this should be solved by both radios belonging to the same group (by setting the same name attribute). 
+2) Value change handler not working properly: when clicking label of the radio button (as opposed to radio circle itself) query/table input often don't change
+Implemented fix. Tested with firefox and chrome and now working fine. Please review and merge. 
+/n
+I have declared an event with an attribute @expires 10m.
+I have a rule which accumulates these events over window:time(10m).With this setup, the number of facts keeps growing in WM beyond 10 minutes of corresponding facts.If I set the the expires to less, say 9 minutes, they do expire after 9 minutes, and if I set the expires to 11 minutes, they do expire after 11 minutes.So it looks like matching @expires and accumulate time window void any expiry. I couldn't find anything on this in the documentation and please correct if this has been reported already.
+I tried to reproduce the issue you reported with the following test case, but it works for me. In case you're able to provide a different test case reproducing this problem, please attach your reproducer here and reopen this ticket.
+/n
+Sometimes some tests failed on Oracle RAC database due invalid id ordering from db. Some older data has higher id then the newer data. It's caused by how Oracle RAC assigns IDs. On other databases tests run fine.
+All changes merged to 6.3.x and 6.4.x branch.
+All tests pass.
+/n
+The StatelessKieSession's JavaDoc shows an example on how to use the API. However, the example shown in the doc uses the internal CommandFactory API instead of the new KieCommands API. We should not encourage users to use internal APIs.
+the PR has been merged. Are you planning other fixes as part of this ticket or can it be marked as done? 
+Can be marked as done.
+/n
+When Kie server is run on Tomcat container with org.kie.integration.tomcat.JACCValve configured then JBPM operations which needs authorisation invoked on Kie server fails with:
+"User '[UserImpl:'Roles']' does not have permissions to execute operation...". Error happens just with JACCValve which is used for Workbench, so this isn't critical issue. Issue is caused by JACCValve which register PolicyContextHandler with Subject returning 2 principals in HashSet, one principal represents user, second represent its roles. 
+JACCIdentityProvider in Kie server in method getName() returns first principal from Subject which it finds, in case it is roles principal then is returned "Roles" as user name, which is wrong.
+fixed and merged into master and 6.4.x 
+/n
+QueryDataServiceIntegrationTest fails when it is run against MySQL 5.5 database. It is caused by errors in SQL expressions for queries.
+pull request merged for both master and 6.4.x branches 
+/n
+At the moment kie-ci can make a deploy on the local repository, using it as it was a remote one. It is required to changed its API in order to allow it to make a deploy on any repository.
+If adding support for "deploy" (to RemoteRepository) in addition to "install" (to LocalRepository) please also honour <distributionManagement> in the (KieModule) Project's pom.xml. We'd be able to leverage Kie's MavenRepository to install and deploy artifacts; removing the existing code from Guvnor. 
+/n
+POI bundle declared in drools-karaf-features needs to be upgraded to align to the non-OSGi world, which was upgraded a while ago.
+Temporary upgrade to 3.11 done. Waiting for Servicemix bundle version 3.13_2 to get released as 3.13_1 is borked (self-imports package which does not exist anymore) and cannot be used. 
+/n
+kie-infinispan contains dependency overrides which are a very bad thing. We need to remove those.
+Also might be worth doing a regex search like "\<version\>[^(6\.4)]" in all pom.xml files with IntelliJ's "find in path".
+That might unveil a few more. 
+Removing the overrides in kie-infinispan of course breaks the whole thing (because of ISPN upgrade). We need to fix that, Marco Rietveld volunteered to look at it 
+Most of the work has been already done. For the time being, we need to overwrite Hibernate version as ISPN 8.x no longer works with Hibernate 4.x. This overwrite will be removed once we upgrade Hibernate also in IP BOM.
+/n
+Some containers allow deployments of artifacts in "expanded" mode (instead of a unique jar/ear/war/... file, al artifacts are deployed full decompressed, so they are directories). This is default with last JBoss Tools and Wildfly (unless you use compressed option for deployments). In that case drools fails to load jar contents.
+Do you plan to add fox also to 6.4.0?
+Or is available any workaround? 
+One workaround seems to be JRebel, that one translates Jar to target/classes and seems to do its job to pass through well
+/n
+When I try to retrieve best solution from Solver in Kie server OptaPlanner extension, JAXB and XSTREAM works correctly but JSON doesn't. JSON marshalling isn't able to map planning variable in planning entity. It can be simulated using cloudbalance problem which is part of Kie server OptaPlanner integration tests. See test method testGetBestSolution in OptaplannerIntegrationTest.
+These PR contain that test, but it's currently ignored for JSON because that doesn't work yet. 
